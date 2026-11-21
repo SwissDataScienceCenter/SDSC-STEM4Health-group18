@@ -68,14 +68,24 @@ One row per batch × sampling day (14 rows per batch). Columns:
   (dead cell density) and `viability = vcd / tcd`. Not new information, but worth reporting
   explicitly since the brief frames the process in these terms.
 - Per feed: `{feed}_prev` (dosed between previous sample and this one), `{feed}_next` (dosed
-  between this sample and next), `{feed}_cum` (total dosed up to this sample time),
-  `{feed}_total` (total per batch). Also `{feed}_next_per_vol` (= `{feed}_next / volume` at
-  this sample time) for all four feeds — feeds scale with current reactor state and `dtb_checks`
-  confirmed strong correlation of `feed_b` with `vcd * volume`.
+  between this sample and next), `{feed}_cum` (total dosed up to this sample time).
+  Also `{feed}_next_per_vol` (= `{feed}_next / volume` at this sample time) for all four
+  feeds — feeds scale with current reactor state and `dtb_checks` confirmed strong
+  correlation of `feed_b` with `vcd * volume`.
+  **No `{feed}_total`:** the total feed for an entire batch is future information at
+  prediction time (you don't know on day 5 how much feed will be added on day 12).
+  `{feed}_cum` captures everything known up to the current time without leakage.
 - `time_to_end` (= total batch duration - elapsed_time), for models that need to know how
   much time is left.
 
 Saved to `outputs/dtb_daily.parquet`. Every model reads this; no one re-parses the raw CSV.
+
+**On `dvol_next`:** this column encodes the volume change between the current sample and the
+next one. This is safe to include for test batches because the volume schedule is nearly
+identical across *all* batches, train and test alike (confirmed in `dtb_viz.py` — "nearly
+identical ramp across all batches, train and test alike"). The volume at day t+1 is effectively
+known from the fixed schedule. If this assumption ever breaks (e.g., a future data release
+introduces batch-specific volume deviations), drop `dvol_next` for test rows.
 
 **Specification to verify before proceeding:**
 - Every batch has exactly 14 rows (days 0–13).
@@ -96,9 +106,15 @@ def evaluate(model_predict_fn) -> dict:
     """Returns dict with per-target MAPE + mean_mape, plus per-fold breakdown."""
 ```
 
-Use `max(|true|, 1e-8)` in the denominator so our CV eval never divides by zero.
-The leaderboard doesn't have this issue (true values are non-zero) but our CV
-folds might see near-zero predictions hitting near-zero true values.
+Use the **exact leaderboard formula** — `|true - pred| / |true|` with **no epsilon** —
+so our CV numbers are directly comparable to the leaderboard. Run a pre-check: assert
+all training true values are > 0.001 (they are — `dtb_checks.py` confirms zero true values
+are absent from measurement rows). If any true value is exactly zero, fall back to
+the epsilon-guarded version and document the discrepancy, but as of the current data
+this is a non-issue. Since predictions can be arbitrarily close to zero, guard against
+`pred / 0` (division by zero in the *prediction* side never happens; it's `true` in
+the denominator). A `max(|true|, 1e-12)` guard costs nothing and handles edge cases
+if the data changes in future releases.
 
 #### 2b. Cross-validation
 - **GroupKFold, 5 folds, split by batch, fixed `random_state=42`**.
@@ -124,8 +140,8 @@ A step-ahead model that looks great in one-step CV but terrible on roll-out is n
 |---|------|------|-------------------|
 | 0 | **Baseline** | Mean-trajectory per day (ratio-to-day0 mean curve, scaled per batch) + current ExtraTrees ensemble from `dtb_solve.py`, both re-scored in MAPE via the new harness | Honest starting point; expect ET near 8.0 mean MAPE |
 | 1 | **Log targets** | Fit on `log1p(target)`, predict and exponentiate. Also try `log(target)` with clip — MAPE penalizes relative error so log-space MSE aligns better | Improvement over row 0 on at least 3 of 4 targets |
-| 2 | **Model × loss sweep** | Run the queued combinations in §3a: GBM / ExtraTrees × {log1p, weighted-MSE, Huber} loss × {raw, ratio-to-day0, log} representation (bounded — see §3a for why it stays small) | Meaningful gain on the worst-performing target from row 1; pick winner by CV mean MAPE |
-| 3 | **Ratio prediction** | Predict `target / init_target` (ratio to day-0 value). This removes batch-to-batch scale differences — a batch that starts with 2× cells will have ~2× trajectory. Also try ratio to population median curve ("detrended" prediction) | Lower per-fold variance than row 2 |
+| 2 | **Ratio prediction** | Predict `target / init_target` (ratio to day-0 value). This removes batch-to-batch scale differences — a batch that starts with 2× cells will have ~2× trajectory. Also try ratio to population median curve ("detrended" prediction) | Lower per-fold variance than row 1; ratio representation is now a known quantity before the sweep in row 3 |
+| 3 | **Model × loss sweep** | Run the queued combinations in §3a: GBM / ExtraTrees × {log1p, weighted-MSE, Huber} loss × {raw, ratio-to-day0, log} representation (bounded — see §3a for why it stays small) | Meaningful gain on the worst-performing target from rows 1–2; pick winner by CV mean MAPE |
 | 4 | **Feed-aware features** | Add interaction features: `feed_{f}_per_vcd`, `feed_{f}_per_tcd`, cumulative feed ratios, time-since-last-feed. Feed timing matters — a dose at day 2 hits differently than at day 10 | Improvement on substrate (the target most affected by feeds) |
 | 5 | **Step-ahead** | Model `target(t+1) - target(t)` (delta) from state at t + feeds between t and t+1. Roll out for test batches. Compare one-step vs roll-out MAPE | Roll-out MAPE within 10% of one-step; if error explodes, abandon |
 
@@ -135,7 +151,7 @@ A step-ahead model that looks great in one-step CV but terrible on roll-out is n
 and move to review + submission. Don't chase hundredths — the leaderboard variance likely
 exceeds that. This rule also applies *inside* §3a's sweep — see its last line.
 
-### 3a. Models and losses queued for experiment 2
+### 3a. Models and losses queued for experiment 3
 
 Deliberately kept small and low-risk (see §6 for the bigger, riskier candidate list that's
 parked rather than queued):
@@ -147,9 +163,11 @@ parked rather than queued):
 - **Losses:** `log1p(target)` + MSE (experiment 1), weighted MSE with weight `= 1/true²`
   (approximates squared relative error with no back-transform bias), and Huber loss (robust to
   the flagged outlier batches: Batch14 d1 vcd, Batch29/34 d13 byproduct).
-- **Representations:** raw, ratio-to-day0, log — reuses experiment 3's ratio idea.
+- **Representations:** raw, ratio-to-day0, log. Ratio is already validated by
+  experiment 2 before this sweep starts, so it's a known-good baseline here rather
+  than an unknown.
 
-That's 2 models × 3 losses × 3 representations = 18 runs, each logged to
+That's 2 models × 3 losses × 3 representations = 18 runs maximum, each logged to
 `outputs/experiments_dtb.csv`. **Apply the plateau rule inside this sweep too:** once a loss or
 representation choice stops moving the number (< 0.2 MAPE for 2 consecutive runs), stop varying
 it and fix it for the rest of the sweep — don't run all 18 blind.

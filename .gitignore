@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Outputs directory — submissions and logs are tracked, raw generated files are not
+outputs/*.png
+outputs/*.parquet
+
+# IDE
+.vscode/
+.idea/
+
+# Conda env
+.env/
